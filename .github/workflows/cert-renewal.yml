@@ -1,0 +1,228 @@
+name: Concert Certificate Renewal
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRIGGER
+# Concert creates a GitHub Issue with label "cert-renewal".
+# This workflow fires when that label is applied to any open issue.
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  renew-certificate:
+    # Only run when the label "cert-renewal" is added
+    if: github.event.label.name == 'cert-renewal'
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ── 1. Checkout repo ───────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Comment on issue — workflow started ─────────────────────────────
+      - name: Comment — workflow started
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '🔄 **Certificate Renewal Workflow started**\n\n' +
+                    '- Step 1: Request new certificate from Vault PKI\n' +
+                    '- Step 2: Update OpenShift TLS Secret\n' +
+                    '- Step 3: Patch Route with new certificate\n' +
+                    '- Step 4: Validate deployment\n' +
+                    '- Step 5: Close issue with evidence'
+            })
+
+      # ── 3. Install OpenShift CLI ───────────────────────────────────────────
+      - name: Install oc CLI
+        run: |
+          curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz \
+            | tar xz -C /usr/local/bin oc kubectl
+          oc version --client
+
+      # ── 4. Login to OpenShift ──────────────────────────────────────────────
+      - name: Login to OpenShift
+        run: |
+          oc login \
+            --server="${{ secrets.OC_SERVER }}" \
+            --token="${{ secrets.OC_TOKEN }}" \
+            --insecure-skip-tls-verify=true
+          oc project demo-inventory-app
+
+      # ── 5. Request new 365-day certificate from Vault PKI ─────────────────
+      - name: Issue new certificate from Vault
+        run: |
+          # Call Vault PKI to issue a 365-day replacement certificate
+          RESPONSE=$(curl -s \
+            --header "X-Vault-Token: ${{ secrets.VAULT_TOKEN }}" \
+            --header "X-Vault-Namespace: ${{ secrets.VAULT_NAMESPACE }}" \
+            --request POST \
+            --data '{
+              "common_name": "localhost",
+              "ttl": "8760h"
+            }' \
+            "${{ secrets.VAULT_ADDR }}/v1/pki_inventory_api/issue/inventory-api-short")
+
+          echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin)['data']; open('new-cert.crt','w').write(d['certificate']); open('new-key.key','w').write(d['private_key'])"
+
+          echo "✅ New certificate issued from Vault"
+
+          # Print cert details (no private key)
+          openssl x509 -in new-cert.crt -noout -dates -subject -fingerprint -sha256
+
+      # ── 6. Update kubernetes.io/tls Secret in OpenShift ───────────────────
+      - name: Update TLS Secret in OpenShift
+        run: |
+          # Delete and recreate the TLS Secret with new cert/key
+          oc delete secret inventory-api-tls -n demo-inventory-app --ignore-not-found
+
+          oc create secret tls inventory-api-tls \
+            --cert=new-cert.crt \
+            --key=new-key.key \
+            -n demo-inventory-app
+
+          # Re-apply labels and annotations
+          oc label secret inventory-api-tls \
+            -n demo-inventory-app \
+            app=inventory-api \
+            concert-monitor=true
+
+          EXPIRY=$(openssl x509 -in new-cert.crt -noout -enddate | cut -d= -f2)
+          FINGERPRINT=$(openssl x509 -in new-cert.crt -noout -fingerprint -sha256 | cut -d= -f2)
+
+          oc annotate secret inventory-api-tls \
+            -n demo-inventory-app \
+            cert-source=vault-pki \
+            cert-role=inventory-api-short \
+            cert-issued="$(date -u +%Y-%m-%d)" \
+            cert-expires="$EXPIRY" \
+            cert-ttl-days=365 \
+            cert-fingerprint="$FINGERPRINT" \
+            cert-renewed-by="concert-github-workflow" \
+            cert-renewal-issue="${{ github.event.issue.number }}"
+
+          echo "✅ TLS Secret updated in OpenShift"
+
+      # ── 7. Patch Route with new certificate ───────────────────────────────
+      - name: Patch Route with new certificate
+        run: |
+          NEW_CERT=$(cat new-cert.crt)
+          NEW_KEY=$(cat new-key.key)
+
+          # Build indented cert for YAML
+          CERT_INDENTED=$(echo "$NEW_CERT" | sed 's/^/      /')
+          KEY_INDENTED=$(echo "$NEW_KEY"  | sed 's/^/      /')
+
+          cat > /tmp/route-patch.yaml <<EOF
+          spec:
+            tls:
+              termination: edge
+              insecureEdgeTerminationPolicy: Redirect
+              certificate: |
+          ${CERT_INDENTED}
+              key: |
+          ${KEY_INDENTED}
+          EOF
+
+          oc patch route inventory-api \
+            -n demo-inventory-app \
+            --type merge \
+            -p "$(cat /tmp/route-patch.yaml)"
+
+          echo "✅ Route patched with new certificate"
+
+      # ── 8. Validate ────────────────────────────────────────────────────────
+      - name: Validate deployment
+        run: |
+          ENDPOINT=$(oc get route inventory-api \
+            -n demo-inventory-app \
+            -o jsonpath='{.spec.host}')
+
+          echo "Endpoint: $ENDPOINT"
+
+          # Wait up to 30s for Route to propagate
+          sleep 10
+
+          # TLS certificate check
+          EXPIRY=$(echo | openssl s_client -connect "$ENDPOINT:443" \
+            -servername "$ENDPOINT" 2>/dev/null | \
+            openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+          echo "Certificate expiry from live endpoint: $EXPIRY"
+
+          # Health check
+          HTTP=$(curl -sk -o /dev/null -w "%{http_code}" "https://$ENDPOINT/api/items")
+          echo "API health check: HTTP $HTTP"
+
+          if [ "$HTTP" != "200" ]; then
+            echo "❌ Health check failed"
+            exit 1
+          fi
+
+          echo "✅ Validation passed"
+
+          # Save results for issue comment
+          echo "ENDPOINT=$ENDPOINT" >> $GITHUB_ENV
+          echo "CERT_EXPIRY=$EXPIRY"  >> $GITHUB_ENV
+
+      # ── 9. Close issue with evidence ──────────────────────────────────────
+      - name: Close issue with evidence
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fingerprint = require('child_process')
+              .execSync('openssl x509 -in new-cert.crt -noout -fingerprint -sha256')
+              .toString().trim()
+
+            const expiry = require('child_process')
+              .execSync('openssl x509 -in new-cert.crt -noout -enddate')
+              .toString().trim()
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `✅ **Certificate Renewal Complete**\n\n` +
+                    `| Field | Value |\n` +
+                    `|-------|-------|\n` +
+                    `| New Certificate | ${expiry} |\n` +
+                    `| Fingerprint | ${fingerprint} |\n` +
+                    `| Issued By | Vault PKI (pki_inventory_api) |\n` +
+                    `| TTL | 365 days |\n` +
+                    `| Route Updated | ✅ |\n` +
+                    `| TLS Secret Updated | ✅ |\n` +
+                    `| Health Check | HTTP 200 ✅ |\n` +
+                    `| Concert Re-discovery | Trigger manually or wait for scheduled scan |\n\n` +
+                    `**Next:** Re-run Concert auto-discovery on \`demo-inventory-app\` to clear the expiry alert.`
+            })
+
+            // Close the issue
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              state: 'closed',
+              labels: ['cert-renewal', 'cert-renewed']
+            })
+
+      # ── 10. On failure — comment and leave issue open ─────────────────────
+      - name: Comment on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '❌ **Certificate Renewal FAILED**\n\n' +
+                    'Check the [workflow run](' +
+                    `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}` +
+                    ') for details.\n\n' +
+                    'Issue remains open for manual intervention.'
+            })
